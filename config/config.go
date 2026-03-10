@@ -32,7 +32,11 @@ func DefaultConfigPath() string {
 	return filepath.Join(home, ".cairo", "config.yaml")
 }
 
-// Load reads the config file. Missing file is not an error — env vars still work.
+// Load reads the config. Priority (highest to lowest):
+//  1. Real environment variables (already set in shell)
+//  2. .env file in the current working directory
+//  3. config.yaml
+//  4. Built-in defaults
 func Load(path string) (*Config, error) {
 	if path == "" {
 		path = DefaultConfigPath()
@@ -41,21 +45,74 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{}
 	setDefaults(cfg)
 
+	// 1. config.yaml (lowest priority after defaults)
 	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			applyEnvOverrides(cfg)
-			return cfg, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
-
-	if err := parseYAML(cfg, string(data)); err != nil {
-		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	if len(data) > 0 {
+		if err := parseYAML(cfg, string(data)); err != nil {
+			return nil, fmt.Errorf("parsing config %s: %w", path, err)
+		}
 	}
 
+	// 2. .env file in cwd (overrides config.yaml)
+	if err := loadDotEnv(".env"); err != nil {
+		return nil, fmt.Errorf(".env: %w", err)
+	}
+
+	// 3. Real env vars (highest priority)
 	applyEnvOverrides(cfg)
+
 	return cfg, nil
+}
+
+// loadDotEnv reads KEY=VALUE pairs from a file and sets them via os.Setenv
+// only if the key is not already set in the environment.
+func loadDotEnv(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // .env is optional
+		}
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// skip blanks and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// strip optional "export " prefix
+		line = strings.TrimPrefix(line, "export ")
+
+		idx := strings.Index(line, "=")
+		if idx < 0 {
+			continue // not a KEY=VALUE line, skip silently
+		}
+
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+
+		// strip surrounding quotes: "value" or 'value'
+		if len(val) >= 2 {
+			if (val[0] == '"' && val[len(val)-1] == '"') ||
+				(val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+		}
+
+		// only set if not already present in the real environment
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
+	}
+	return scanner.Err()
 }
 
 // WriteExample creates a default config file at ~/.cairo/config.yaml.
@@ -69,7 +126,8 @@ func WriteExample() error {
 
 func ExampleConfig() string {
 	return `# Cairo configuration
-default_provider: anthropic
+# Tip: you can also put your API keys in a .env file next to your project.
+default_provider: gemini
 
 openai:
   api_key: ""
@@ -86,7 +144,7 @@ gemini:
 }
 
 func setDefaults(cfg *Config) {
-	cfg.DefaultProvider = "anthropic"
+	cfg.DefaultProvider = "gemini"
 	cfg.OpenAI.Model = "gpt-4o"
 	cfg.Anthropic.Model = "claude-sonnet-4-20250514"
 	cfg.Gemini.Model = "gemini-2.0-flash"
@@ -124,7 +182,6 @@ func parseYAML(cfg *Config, content string) error {
 
 		trimmed := strings.TrimLeft(line, " ")
 		indent := len(line) - len(trimmed)
-
 		k, v := splitKV(trimmed)
 
 		if indent == 0 {
