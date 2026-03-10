@@ -1,1 +1,1 @@
-A AI agent built which execute tasks through a ReAct-style tool loop
+A AI agent which execute tasks through a ReAct-style tool loop.
