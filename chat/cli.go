@@ -9,11 +9,11 @@ import (
 
 	"github.com/themillenniumfalcon/cairo/agent"
 	"github.com/themillenniumfalcon/cairo/llm"
+	"github.com/themillenniumfalcon/cairo/tools"
 )
 
 // CLI runs an interactive chat session in the terminal.
-// sess is a pre-loaded session (may have existing history).
-func CLI(provider llm.Provider, sess *agent.Session) error {
+func CLI(provider llm.Provider, sess *agent.Session, registry *tools.Registry) error {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Printf("Cairo  ·  %s / %s  ·  session: %s\n",
@@ -40,7 +40,6 @@ func CLI(provider llm.Provider, sess *agent.Session) error {
 			continue
 		}
 
-		// Built-in slash commands
 		if strings.HasPrefix(input, "/") {
 			if handled, err := handleCommand(input, sess); handled {
 				if err != nil {
@@ -59,17 +58,27 @@ func CLI(provider llm.Provider, sess *agent.Session) error {
 			fmt.Printf("warning: could not save message: %v\n", err)
 		}
 
-		fmt.Print("cairo → ")
-		reply, err := provider.Chat(context.Background(), sess.History)
+		// Run the ReAct loop
+		reply, err := agent.RunReAct(
+			context.Background(),
+			provider,
+			registry,
+			sess.History,
+			func(step agent.Step) {
+				// Print each tool-use step as it happens
+				fmt.Printf("\n  thought: %s\n", step.Thought)
+				fmt.Printf("   action: %s(%s)\n", step.Action, truncate(step.ActionInput, 60))
+				fmt.Printf("  observe: %s\n\n", truncate(step.Observation, 120))
+			},
+		)
 		if err != nil {
 			fmt.Printf("error: %v\n\n", err)
-			// Roll back the user message from history on failure
+			// Roll back the unsaved user message
 			sess.History = sess.History[:len(sess.History)-1]
 			continue
 		}
 
-		fmt.Println(reply)
-		fmt.Println()
+		fmt.Printf("cairo → %s\n\n", reply)
 
 		if err := sess.Add(llm.RoleAssistant, reply); err != nil {
 			fmt.Printf("warning: could not save reply: %v\n", err)
@@ -77,7 +86,6 @@ func CLI(provider llm.Provider, sess *agent.Session) error {
 	}
 }
 
-// handleCommand processes /commands. Returns (handled, err).
 func handleCommand(input string, sess *agent.Session) (bool, error) {
 	parts := strings.Fields(input)
 	cmd := parts[0]
@@ -89,12 +97,12 @@ func handleCommand(input string, sess *agent.Session) (bool, error) {
 		fmt.Println("  /clear     clear this session's history")
 		fmt.Println("  /info      show session info")
 		fmt.Println("  /exit      quit")
+		fmt.Println()
 		return true, nil
 
 	case "/history":
-		msgs := sess.History
 		count := 0
-		for _, m := range msgs {
+		for _, m := range sess.History {
 			if m.Role == "system" {
 				continue
 			}
@@ -135,4 +143,12 @@ func handleCommand(input string, sess *agent.Session) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }

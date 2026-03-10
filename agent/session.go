@@ -5,6 +5,7 @@ import (
 
 	"github.com/themillenniumfalcon/cairo/db"
 	"github.com/themillenniumfalcon/cairo/llm"
+	"github.com/themillenniumfalcon/cairo/tools"
 )
 
 const systemPrompt = `You are Cairo, a personal AI agent. You are helpful, concise, and direct.`
@@ -12,13 +13,14 @@ const systemPrompt = `You are Cairo, a personal AI agent. You are helpful, conci
 // Session holds an active conversation: its DB record + in-memory message history.
 type Session struct {
 	Record  *db.Session
-	History []llm.Message // full history including system prompt
+	History []llm.Message
 	store   *db.DB
 }
 
 // LoadOrCreate loads a named session from the DB (creating it if new)
 // and reconstructs the in-memory message history.
-func LoadOrCreate(store *db.DB, name, provider, model string) (*Session, bool, error) {
+// The registry is used to build the system prompt with the tool block.
+func LoadOrCreate(store *db.DB, registry *tools.Registry, name, provider, model string) (*Session, bool, error) {
 	record, isNew, err := store.GetOrCreateSession(name, provider, model)
 	if err != nil {
 		return nil, false, fmt.Errorf("session: %w", err)
@@ -28,7 +30,7 @@ func LoadOrCreate(store *db.DB, name, provider, model string) (*Session, bool, e
 		Record: record,
 		store:  store,
 		History: []llm.Message{
-			{Role: llm.RoleSystem, Content: systemPrompt},
+			{Role: llm.RoleSystem, Content: BuildSystemPrompt(registry)},
 		},
 	}
 

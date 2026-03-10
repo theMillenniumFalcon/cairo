@@ -12,9 +12,10 @@ import (
 	"github.com/themillenniumfalcon/cairo/config"
 	"github.com/themillenniumfalcon/cairo/db"
 	"github.com/themillenniumfalcon/cairo/llm"
+	"github.com/themillenniumfalcon/cairo/tools"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 const usage = `Cairo — personal AI agent
 
@@ -22,8 +23,8 @@ USAGE:
   cairo [flags] [message]
   cairo <subcommand> [args]
 
-  If a message is provided, Cairo responds and exits (one-shot mode).
-  Without a message, Cairo starts an interactive chat session.
+  Without a message: starts an interactive chat session.
+  With a message: one-shot query, then exits.
 
 FLAGS:
   -provider  string   LLM provider: openai | anthropic | gemini (default: from config)
@@ -38,13 +39,18 @@ SUBCOMMANDS:
   sessions delete <name>        Delete a session and its history
   sessions rename <old> <new>   Rename a session
 
+BUILT-IN TOOLS:
+  shell      Run shell commands
+  read_file  Read a file
+  write_file Write a file
+  list_dir   List directory contents
+  fetch      HTTP GET a URL
+
 EXAMPLES:
-  cairo                                 # interactive chat (default session)
-  cairo -session myproject              # resume or start named session
-  cairo "explain recursion"             # one-shot query
-  cairo -provider openai "hello"        # use specific provider
-  cairo sessions list                   # see all sessions
-  cairo sessions delete myproject       # delete a session
+  cairo                                 # interactive chat
+  cairo -session myproject              # named session
+  cairo "list files in current dir"     # one-shot with tool use
+  cairo sessions list
 `
 
 func main() {
@@ -73,12 +79,12 @@ func run() error {
 
 	args := flag.Args()
 
-	// init subcommand — needs no DB
+	// init — no DB needed
 	if len(args) > 0 && args[0] == "init" {
 		if err := config.WriteExample(); err != nil {
 			return fmt.Errorf("init: %w", err)
 		}
-		fmt.Printf("Created config at %s\nAdd your API keys and run 'cairo' to start chatting.\n",
+		fmt.Printf("Created config at %s\nAdd your API keys and run 'cairo' to start.\n",
 			config.DefaultConfigPath())
 		return nil
 	}
@@ -107,29 +113,53 @@ func run() error {
 		return err
 	}
 
-	// Load or create the session
-	sess, _, err := agent.LoadOrCreate(store, *sessionFlag, provider.Name(), provider.Model())
+	// Build tool registry
+	registry := buildRegistry()
+
+	// Load or create session
+	sess, _, err := agent.LoadOrCreate(store, registry, *sessionFlag, provider.Name(), provider.Model())
 	if err != nil {
 		return err
 	}
 
-	// One-shot mode: cairo [flags] "some message"
+	// One-shot mode
 	if len(args) > 0 {
 		input := strings.Join(args, " ")
 
 		if err := sess.Add(llm.RoleUser, input); err != nil {
 			return err
 		}
-		reply, err := provider.Chat(context.Background(), sess.History)
+
+		reply, err := agent.RunReAct(
+			context.Background(),
+			provider,
+			registry,
+			sess.History,
+			func(step agent.Step) {
+				fmt.Fprintf(os.Stderr, "  [%s] %s\n", step.Action, step.ActionInput)
+			},
+		)
 		if err != nil {
 			return err
 		}
+
 		fmt.Println(reply)
 		return sess.Add(llm.RoleAssistant, reply)
 	}
 
 	// Interactive mode
-	return chat.CLI(provider, sess)
+	return chat.CLI(provider, sess, registry)
+}
+
+// buildRegistry registers all built-in tools.
+func buildRegistry() *tools.Registry {
+	r := tools.NewRegistry()
+	r.Register(tools.Shell{})
+	r.Register(tools.ReadFile{})
+	r.Register(tools.WriteFile{})
+	r.Register(tools.ListDir{})
+	r.Register(tools.NewFetch())
+	return r
 }
 
 func runSessionsCmd(store *db.DB, args []string) error {
