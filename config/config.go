@@ -25,6 +25,10 @@ type Config struct {
 		APIKey string
 		Model  string
 	}
+
+	Telegram struct {
+		BotToken string
+	}
 }
 
 func DefaultConfigPath() string {
@@ -162,6 +166,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if p := os.Getenv("CAIRO_PROVIDER"); p != "" {
 		cfg.DefaultProvider = p
+	}
+	if t := os.Getenv("TELEGRAM_BOT_TOKEN"); t != "" {
+		cfg.Telegram.BotToken = t
 	}
 }
 

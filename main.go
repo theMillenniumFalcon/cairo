@@ -4,8 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/themillenniumfalcon/cairo/agent"
 	"github.com/themillenniumfalcon/cairo/chat"
@@ -15,7 +18,7 @@ import (
 	"github.com/themillenniumfalcon/cairo/tools"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 const usage = `Cairo — personal AI agent
 
@@ -35,8 +38,9 @@ FLAGS:
 
 SUBCOMMANDS:
   init                          Create default config at ~/.cairo/config.yaml
+  telegram                      Start the Telegram bot (long-polling)
   sessions list                 List all sessions
-  sessions delete <name>        Delete a session and its history
+  sessions delete <n>           Delete a session and its history
   sessions rename <old> <new>   Rename a session
 
 BUILT-IN TOOLS:
@@ -50,6 +54,7 @@ EXAMPLES:
   cairo                                 # interactive chat
   cairo -session myproject              # named session
   cairo "list files in current dir"     # one-shot with tool use
+  cairo telegram                        # start Telegram bot
   cairo sessions list
 `
 
@@ -116,6 +121,11 @@ func run() error {
 	// Build tool registry
 	registry := buildRegistry()
 
+	// telegram subcommand
+	if len(args) > 0 && args[0] == "telegram" {
+		return runTelegram(cfg, provider, registry, store)
+	}
+
 	// Load or create session
 	sess, _, err := agent.LoadOrCreate(store, registry, *sessionFlag, provider.Name(), provider.Model())
 	if err != nil {
@@ -147,8 +157,32 @@ func run() error {
 		return sess.Add(llm.RoleAssistant, reply)
 	}
 
-	// Interactive mode
+	// Interactive CLI mode
 	return chat.CLI(provider, sess, registry)
+}
+
+// runTelegram starts the Telegram bot and blocks until SIGINT/SIGTERM.
+func runTelegram(cfg *config.Config, provider llm.Provider, registry *tools.Registry, store *db.DB) error {
+	token := cfg.Telegram.BotToken
+	if token == "" {
+		return fmt.Errorf("telegram: TELEGRAM_BOT_TOKEN is not set\n\nAdd it to your .env file:\n  TELEGRAM_BOT_TOKEN=your-token-here\n\nGet a token from @BotFather on Telegram.")
+	}
+
+	bot := chat.NewBot(token, provider, registry, store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Graceful shutdown on Ctrl+C / SIGTERM
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		log.Println("cairo: shutting down…")
+		cancel()
+	}()
+
+	return bot.Run(ctx)
 }
 
 // buildRegistry registers all built-in tools.
@@ -194,7 +228,7 @@ func runSessionsCmd(store *db.DB, args []string) error {
 
 	case "delete":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: cairo sessions delete <name>")
+			return fmt.Errorf("usage: cairo sessions delete <n>")
 		}
 		if err := store.DeleteSession(args[1]); err != nil {
 			return err

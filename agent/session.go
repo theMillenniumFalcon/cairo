@@ -79,3 +79,18 @@ func (s *Session) ClearHistory() error {
 	}
 	return nil
 }
+
+// NewEphemeral returns an in-memory-only session with no DB backing.
+// Used as a fallback when DB is unavailable.
+func NewEphemeral(provider, model string, registry *tools.Registry) *Session {
+	return &Session{
+		Record: &db.Session{
+			Name:     "ephemeral",
+			Provider: provider,
+			Model:    model,
+		},
+		History: []llm.Message{
+			{Role: llm.RoleSystem, Content: BuildSystemPrompt(registry)},
+		},
+	}
+}
