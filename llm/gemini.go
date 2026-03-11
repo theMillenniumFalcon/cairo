@@ -1,12 +1,14 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 const geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -19,7 +21,7 @@ type GeminiProvider struct {
 
 func NewGemini(apiKey, model string) (*GeminiProvider, error) {
 	if apiKey == "" {
-		return nil, fmt.Errorf("gemini: api_key is required (set in config or GEMINI_API_KEY)")
+		return nil, fmt.Errorf("gemini: api_key is required (set GEMINI_API_KEY in .env)")
 	}
 	return &GeminiProvider{
 		apiKey: apiKey,
@@ -32,7 +34,89 @@ func (p *GeminiProvider) Name() string  { return "gemini" }
 func (p *GeminiProvider) Model() string { return p.model }
 
 func (p *GeminiProvider) Chat(ctx context.Context, messages []Message) (string, error) {
-	// Gemini API structure
+	body, err := p.buildRequest(messages)
+	if err != nil {
+		return "", err
+	}
+
+	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, p.model, p.apiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("gemini: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gemini: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("gemini: read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gemini: API error %d: %s", resp.StatusCode, string(data))
+	}
+
+	return p.parseResponse(data)
+}
+
+func (p *GeminiProvider) Stream(ctx context.Context, messages []Message, onToken func(string)) error {
+	body, err := p.buildRequest(messages)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("%s/%s:streamGenerateContent?alt=sse&key=%s", geminiBaseURL, p.model, p.apiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("gemini: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("gemini: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gemini: API error %d: %s", resp.StatusCode, string(data))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var event struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		if len(event.Candidates) > 0 && len(event.Candidates[0].Content.Parts) > 0 {
+			onToken(event.Candidates[0].Content.Parts[0].Text)
+		}
+	}
+	return scanner.Err()
+}
+
+func (p *GeminiProvider) buildRequest(messages []Message) ([]byte, error) {
 	type part struct {
 		Text string `json:"text"`
 	}
@@ -52,51 +136,17 @@ func (p *GeminiProvider) Chat(ctx context.Context, messages []Message) (string, 
 	for _, m := range messages {
 		switch m.Role {
 		case RoleSystem:
-			body.SystemInstruction = &systemInstruction{
-				Parts: []part{{Text: m.Content}},
-			}
+			body.SystemInstruction = &systemInstruction{Parts: []part{{Text: m.Content}}}
 		case RoleUser:
-			body.Contents = append(body.Contents, content{
-				Role:  "user",
-				Parts: []part{{Text: m.Content}},
-			})
+			body.Contents = append(body.Contents, content{Role: "user", Parts: []part{{Text: m.Content}}})
 		case RoleAssistant:
-			// Gemini uses "model" for assistant role
-			body.Contents = append(body.Contents, content{
-				Role:  "model",
-				Parts: []part{{Text: m.Content}},
-			})
+			body.Contents = append(body.Contents, content{Role: "model", Parts: []part{{Text: m.Content}}})
 		}
 	}
+	return json.Marshal(body)
+}
 
-	reqData, err := json.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("gemini: marshal request: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiBaseURL, p.model, p.apiKey)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqData))
-	if err != nil {
-		return "", fmt.Errorf("gemini: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("gemini: request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("gemini: read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("gemini: API error %d: %s", resp.StatusCode, string(data))
-	}
-
-	// Parse response
+func (p *GeminiProvider) parseResponse(data []byte) (string, error) {
 	var result struct {
 		Candidates []struct {
 			Content struct {
@@ -118,6 +168,5 @@ func (p *GeminiProvider) Chat(ctx context.Context, messages []Message) (string, 
 	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("gemini: empty response")
 	}
-
 	return result.Candidates[0].Content.Parts[0].Text, nil
 }
