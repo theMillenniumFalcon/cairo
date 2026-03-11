@@ -72,8 +72,7 @@ type DB struct {
 // Pass "" to use the default ~/.cairo/cairo.json.
 func Open(path string) (*DB, error) {
 	if path == "" {
-		home, _ := os.UserHomeDir()
-		path = filepath.Join(home, ".cairo", "cairo.json")
+		path = filepath.Join(".cairo", "cairo.json")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("db: mkdir: %w", err)

@@ -1,0 +1,6 @@
+name: summarize
+description: Summarize any text or content concisely in bullet points
+prompt: |
+  Summarize the following content in clear, concise bullet points (max 5):
+
+  {{.Input}}

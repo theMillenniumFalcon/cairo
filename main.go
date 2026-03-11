@@ -15,10 +15,11 @@ import (
 	"github.com/themillenniumfalcon/cairo/config"
 	"github.com/themillenniumfalcon/cairo/db"
 	"github.com/themillenniumfalcon/cairo/llm"
+	"github.com/themillenniumfalcon/cairo/skills"
 	"github.com/themillenniumfalcon/cairo/tools"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 const usage = `Cairo — personal AI agent
 
@@ -30,11 +31,12 @@ USAGE:
   With a message: one-shot query, then exits.
 
 FLAGS:
-  -provider  string   LLM provider: openai | anthropic | gemini (default: from config)
-  -model     string   Model override (default: from config)
-  -session   string   Session name to resume or create (default: "default")
-  -config    string   Path to config file (default: ~/.cairo/config.yaml)
-  -version           Print version and exit
+  -provider     string   LLM provider: openai | anthropic | gemini (default: from config)
+  -model        string   Model override (default: from config)
+  -session      string   Session name to resume or create (default: "default")
+  -config       string   Path to config file (default: ~/.cairo/config.yaml)
+  -skills-dir   string   Skills directory (default: ~/.cairo/skills)
+  -version              Print version and exit
 
 SUBCOMMANDS:
   init                          Create default config at ~/.cairo/config.yaml
@@ -42,20 +44,21 @@ SUBCOMMANDS:
   sessions list                 List all sessions
   sessions delete <n>           Delete a session and its history
   sessions rename <old> <new>   Rename a session
+  skills list                   List all loaded skills
 
 BUILT-IN TOOLS:
-  shell      Run shell commands
-  read_file  Read a file
-  write_file Write a file
-  list_dir   List directory contents
-  fetch      HTTP GET a URL
+  shell, read_file, write_file, list_dir, fetch
+
+SKILLS (~/.cairo/skills/*.yaml):
+  Add YAML files to define custom tools — no recompile needed.
+  See skills/examples/ in the source for sample skill files.
 
 EXAMPLES:
   cairo                                 # interactive chat
   cairo -session myproject              # named session
-  cairo "list files in current dir"     # one-shot with tool use
+  cairo "summarize this for me: ..."    # one-shot
   cairo telegram                        # start Telegram bot
-  cairo sessions list
+  cairo skills list                     # see loaded skills
 `
 
 func main() {
@@ -67,11 +70,12 @@ func main() {
 
 func run() error {
 	var (
-		providerFlag = flag.String("provider", "", "LLM provider: openai | anthropic | gemini")
-		modelFlag    = flag.String("model", "", "Model override")
-		sessionFlag  = flag.String("session", "default", "Session name")
-		configFlag   = flag.String("config", "", "Path to config file")
-		versionFlag  = flag.Bool("version", false, "Print version")
+		providerFlag  = flag.String("provider", "", "LLM provider: openai | anthropic | gemini")
+		modelFlag     = flag.String("model", "", "Model override")
+		sessionFlag   = flag.String("session", "default", "Session name")
+		configFlag    = flag.String("config", "", "Path to config file")
+		skillsDirFlag = flag.String("skills-dir", "", "Skills directory")
+		versionFlag   = flag.Bool("version", false, "Print version")
 	)
 
 	flag.Usage = func() { fmt.Print(usage) }
@@ -84,7 +88,7 @@ func run() error {
 
 	args := flag.Args()
 
-	// init — no DB needed
+	// init — no DB or provider needed
 	if len(args) > 0 && args[0] == "init" {
 		if err := config.WriteExample(); err != nil {
 			return fmt.Errorf("init: %w", err)
@@ -94,7 +98,7 @@ func run() error {
 		return nil
 	}
 
-	// Load config
+	// Load config (reads .env, config.yaml, env vars)
 	cfg, err := config.Load(*configFlag)
 	if err != nil {
 		return err
@@ -107,7 +111,7 @@ func run() error {
 	}
 	defer store.Close()
 
-	// sessions subcommand
+	// sessions subcommand (no provider needed)
 	if len(args) > 0 && args[0] == "sessions" {
 		return runSessionsCmd(store, args[1:])
 	}
@@ -118,8 +122,20 @@ func run() error {
 		return err
 	}
 
-	// Build tool registry
-	registry := buildRegistry()
+	// Build tool registry (built-ins + skills)
+	registry, loadedSkills, err := buildRegistry(provider, *skillsDirFlag)
+	if err != nil {
+		return err
+	}
+
+	if len(loadedSkills) > 0 {
+		log.Printf("skills: loaded %d skill(s): %s", len(loadedSkills), skillNames(loadedSkills))
+	}
+
+	// skills list subcommand
+	if len(args) > 0 && args[0] == "skills" {
+		return runSkillsCmd(registry, loadedSkills, args[1:])
+	}
 
 	// telegram subcommand
 	if len(args) > 0 && args[0] == "telegram" {
@@ -132,14 +148,13 @@ func run() error {
 		return err
 	}
 
-	// One-shot mode
+	// One-shot mode: cairo [flags] "some message"
 	if len(args) > 0 {
 		input := strings.Join(args, " ")
 
 		if err := sess.Add(llm.RoleUser, input); err != nil {
 			return err
 		}
-
 		reply, err := agent.RunReAct(
 			context.Background(),
 			provider,
@@ -152,7 +167,6 @@ func run() error {
 		if err != nil {
 			return err
 		}
-
 		fmt.Println(reply)
 		return sess.Add(llm.RoleAssistant, reply)
 	}
@@ -161,11 +175,66 @@ func run() error {
 	return chat.CLI(provider, sess, registry)
 }
 
+// buildRegistry creates the tool registry with built-ins and any loaded skills.
+func buildRegistry(provider llm.Provider, skillsDir string) (*tools.Registry, []skills.Skill, error) {
+	r := tools.NewRegistry()
+
+	// Built-in tools
+	r.Register(tools.Shell{})
+	r.Register(tools.ReadFile{})
+	r.Register(tools.WriteFile{})
+	r.Register(tools.ListDir{})
+	r.Register(tools.NewFetch())
+
+	// Load skills from disk
+	loaded, err := skills.LoadDir(skillsDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load skills: %w", err)
+	}
+
+	for _, st := range skills.AsTools(loaded, provider) {
+		r.Register(st)
+	}
+
+	return r, loaded, nil
+}
+
+// runSkillsCmd handles: skills list
+func runSkillsCmd(registry *tools.Registry, loaded []skills.Skill, args []string) error {
+	sub := "list"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+
+	switch sub {
+	case "list":
+		allTools := registry.All()
+		builtins := 5 // shell, read_file, write_file, list_dir, fetch
+
+		fmt.Printf("Built-in tools (%d):\n", builtins)
+		for _, t := range allTools[:builtins] {
+			fmt.Printf("  %-16s  %s\n", t.Name(), t.Description())
+		}
+
+		fmt.Printf("\nSkills (%d) from %s:\n", len(loaded), skills.DefaultSkillsDir())
+		if len(loaded) == 0 {
+			fmt.Println("  (none — add .yaml files to ~/.cairo/skills/)")
+		} else {
+			for _, t := range allTools[builtins:] {
+				fmt.Printf("  %-16s  %s\n", t.Name(), t.Description())
+			}
+		}
+	default:
+		return fmt.Errorf("unknown skills subcommand %q — try: list", sub)
+	}
+	return nil
+}
+
 // runTelegram starts the Telegram bot and blocks until SIGINT/SIGTERM.
 func runTelegram(cfg *config.Config, provider llm.Provider, registry *tools.Registry, store *db.DB) error {
 	token := cfg.Telegram.BotToken
 	if token == "" {
-		return fmt.Errorf("telegram: TELEGRAM_BOT_TOKEN is not set\n\nAdd it to your .env file:\n  TELEGRAM_BOT_TOKEN=your-token-here\n\nGet a token from @BotFather on Telegram.")
+		return fmt.Errorf("telegram: TELEGRAM_BOT_TOKEN is not set\n\nAdd it to your .env:\n  TELEGRAM_BOT_TOKEN=your-token-here\n\nGet a token from @BotFather on Telegram.")
 	}
 
 	bot := chat.NewBot(token, provider, registry, store)
@@ -173,7 +242,6 @@ func runTelegram(cfg *config.Config, provider llm.Provider, registry *tools.Regi
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Graceful shutdown on Ctrl+C / SIGTERM
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -185,23 +253,13 @@ func runTelegram(cfg *config.Config, provider llm.Provider, registry *tools.Regi
 	return bot.Run(ctx)
 }
 
-// buildRegistry registers all built-in tools.
-func buildRegistry() *tools.Registry {
-	r := tools.NewRegistry()
-	r.Register(tools.Shell{})
-	r.Register(tools.ReadFile{})
-	r.Register(tools.WriteFile{})
-	r.Register(tools.ListDir{})
-	r.Register(tools.NewFetch())
-	return r
-}
+// ── sessions subcommand ───────────────────────────────────────────────────────
 
 func runSessionsCmd(store *db.DB, args []string) error {
 	if len(args) == 0 {
 		fmt.Println("Usage: cairo sessions <list|delete|rename> [args]")
 		return nil
 	}
-
 	switch args[0] {
 	case "list":
 		sessions, err := store.ListSessions()
@@ -216,16 +274,14 @@ func runSessionsCmd(store *db.DB, args []string) error {
 		fmt.Println(strings.Repeat("─", 76))
 		for _, s := range sessions {
 			count, _ := store.CountMessages(s.ID)
-			provModel := s.Provider + "/" + s.Model
 			fmt.Printf("%-4d  %-22s  %-20s  %-19s  %d\n",
 				s.ID,
 				truncate(s.Name, 22),
-				truncate(provModel, 20),
+				truncate(s.Provider+"/"+s.Model, 20),
 				s.UpdatedAt.Format("2006-01-02 15:04:05"),
 				count,
 			)
 		}
-
 	case "delete":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: cairo sessions delete <n>")
@@ -234,7 +290,6 @@ func runSessionsCmd(store *db.DB, args []string) error {
 			return err
 		}
 		fmt.Printf("Session %q deleted.\n", args[1])
-
 	case "rename":
 		if len(args) < 3 {
 			return fmt.Errorf("usage: cairo sessions rename <old-name> <new-name>")
@@ -243,17 +298,25 @@ func runSessionsCmd(store *db.DB, args []string) error {
 			return err
 		}
 		fmt.Printf("Session %q renamed to %q.\n", args[1], args[2])
-
 	default:
 		return fmt.Errorf("unknown sessions subcommand %q — try: list, delete, rename", args[0])
 	}
-
 	return nil
 }
+
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[:n-1] + "…"
+}
+
+func skillNames(ss []skills.Skill) string {
+	names := make([]string, len(ss))
+	for i, s := range ss {
+		names[i] = s.Name
+	}
+	return strings.Join(names, ", ")
 }

@@ -1,0 +1,6 @@
+name: explain_error
+description: Explain a error message and suggest how to fix it
+prompt: |
+  Explain this error message clearly and suggest how to fix it:
+
+  {{.Input}}

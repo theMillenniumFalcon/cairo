@@ -1,0 +1,9 @@
+name: git_log
+description: Show recent git commits and summarize what changed
+command: "git -C {{.Input}} log --oneline -20"
+prompt: |
+  Here are the recent git commits:
+
+  {{.Output}}
+
+  Briefly summarize the recent work and any patterns you notice.

@@ -32,8 +32,7 @@ type Config struct {
 }
 
 func DefaultConfigPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".cairo", "config.yaml")
+	return filepath.Join(".cairo", "config.yaml")
 }
 
 // Load reads the config. Priority (highest to lowest):
